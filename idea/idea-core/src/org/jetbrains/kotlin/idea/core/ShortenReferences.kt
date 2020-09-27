@@ -5,22 +5,30 @@
 
 package org.jetbrains.kotlin.idea.core
 
-import com.intellij.openapi.application.runReadAction
+import com.intellij.openapi.command.CommandProcessor
+import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.util.Ref
 import com.intellij.openapi.util.TextRange
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiElement
 import com.intellij.psi.SmartPsiElementPointer
+import com.intellij.psi.codeStyle.CodeStyleManager
 import com.intellij.psi.impl.source.PostprocessReformattingAspect
 import com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.descriptors.*
 import org.jetbrains.kotlin.idea.analysis.analyzeAsReplacement
 import org.jetbrains.kotlin.idea.caches.resolve.allowResolveInDispatchThread
 import org.jetbrains.kotlin.idea.caches.resolve.getResolutionFacade
+import org.jetbrains.kotlin.idea.core.util.KotlinIdeaCoreBundle
 import org.jetbrains.kotlin.idea.imports.canBeReferencedViaImport
 import org.jetbrains.kotlin.idea.imports.getImportableTargets
 import org.jetbrains.kotlin.idea.references.mainReference
 import org.jetbrains.kotlin.idea.references.resolveToDescriptors
 import org.jetbrains.kotlin.idea.util.*
+import org.jetbrains.kotlin.idea.util.application.isWriteAccessAllowed
+import org.jetbrains.kotlin.idea.util.application.runReadAction
+import org.jetbrains.kotlin.idea.util.application.runWriteAction
 import org.jetbrains.kotlin.incremental.components.NoLookupLocation
 import org.jetbrains.kotlin.psi.*
 import org.jetbrains.kotlin.psi.psiUtil.*
@@ -54,6 +62,8 @@ class ShortenReferences(val options: (KtElement) -> Options = { Options.DEFAULT 
     }
 
     companion object {
+        private val LOG = Logger.getInstance(ShortenReferences::class.java)
+
         @JvmField
         val DEFAULT = ShortenReferences()
 
@@ -178,7 +188,16 @@ class ShortenReferences(val options: (KtElement) -> Options = { Options.DEFAULT 
         actionRunningMode: ActionRunningMode = ActionRunningMode.RUN_IN_CURRENT_THREAD
     ): Collection<KtElement> {
         return runReadAction { elements.groupBy(KtElement::getContainingKtFile) }
-            .flatMap { shortenReferencesInFile(it.key, it.value, elementFilter, actionRunningMode) }
+            .flatMap {
+                val ref = Ref<Collection<KtElement>>()
+                val ktFile = it.key
+                CommandProcessor.getInstance().executeCommand(ktFile.project, {
+                    val shortenReferencesInFile = shortenReferencesInFile(ktFile, it.value, elementFilter, actionRunningMode)
+                    ref.set(shortenReferencesInFile)
+                }, "shorten reference", ktFile)
+
+                ref.get()
+            }
     }
 
     private fun shortenReferencesInFile(
@@ -190,7 +209,8 @@ class ShortenReferences(val options: (KtElement) -> Options = { Options.DEFAULT 
         //TODO: that's not correct since we have options!
         val elementsToUse = dropNestedElements(elements)
 
-        val helper = ImportInsertHelper.getInstance(file.project)
+        val project = file.project
+        val helper = ImportInsertHelper.getInstance(project)
 
         val failedToImportDescriptors = LinkedHashSet<DeclarationDescriptor>()
 
@@ -202,7 +222,9 @@ class ShortenReferences(val options: (KtElement) -> Options = { Options.DEFAULT 
             }
         }
 
+        var pass = 0
         while (true) {
+            pass++
             // Processors order is important here so that enclosing elements are not shortened before their children are, e.g.
             // test.foo(this@A) -> foo(this)
             val processors: List<ShorteningProcessor<*>> = runReadAction {
@@ -214,24 +236,41 @@ class ShortenReferences(val options: (KtElement) -> Options = { Options.DEFAULT 
                 )
             }
 
-            // step 1: collect qualified elements to analyze (no resolve at this step)
-            val visitors = processors.map { it.collectElementsVisitor }
-            runReadAction {
-                for (visitor in visitors) {
-                    for (element in elementsToUse) {
-                        visitor.options = options(element)
-                        element.accept(visitor)
+            val step1And2 = {
+                // step 1: collect qualified elements to analyze (no resolve at this step)
+                val visitors = processors.map { it.collectElementsVisitor }
+                runReadAction {
+                    for (visitor in visitors) {
+                        for (element in elementsToUse) {
+                            visitor.options = options(element)
+                            element.accept(visitor)
+                        }
                     }
+
+                    // step 2: analyze collected elements with resolve and decide which can be shortened now and which need descriptors to be imported before shortening
+                    val allElementsToAnalyze = visitors.flatMap { visitor -> visitor.getElementsToAnalyze().map { it.element } }.toSet()
+
+                    val bindingContext =
+                        if (isWriteAccessAllowed()) {
+                            allowResolveInDispatchThread {
+                                file.getResolutionFacade().analyze(allElementsToAnalyze, BodyResolveMode.PARTIAL_WITH_CFA)
+                            }
+                        } else {
+                            file.getResolutionFacade().analyze(allElementsToAnalyze, BodyResolveMode.PARTIAL_WITH_CFA)
+                        }
+
+
+                    processors.forEach { it.analyzeCollectedElements(bindingContext) }
                 }
+            }
 
-
-                // step 2: analyze collected elements with resolve and decide which can be shortened now and which need descriptors to be imported before shortening
-                val allElementsToAnalyze = visitors.flatMap { visitor -> visitor.getElementsToAnalyze().map { it.element } }.toSet()
-                val bindingContext = allowResolveInDispatchThread {
-                    file.getResolutionFacade().analyze(allElementsToAnalyze, BodyResolveMode.PARTIAL_WITH_CFA)
-                }
-
-                processors.forEach { it.analyzeCollectedElements(bindingContext) }
+            if (isWriteAccessAllowed()) {
+                LOG.warn("Shorten reference should not be invoked under write action")
+                step1And2.invoke()
+            } else {
+                ProgressManager.getInstance().runProcessWithProgressSynchronously(
+                    step1And2, KotlinIdeaCoreBundle.message("shorten.references.pass.0", pass), false, project
+                )
             }
 
             // step 3: shorten elements that can be shortened right now
@@ -247,7 +286,10 @@ class ShortenReferences(val options: (KtElement) -> Options = { Options.DEFAULT 
                 for (descriptor in descriptorsToImport) {
                     assert(descriptor !in failedToImportDescriptors)
 
-                    val result = helper.importDescriptor(file, descriptor)
+                    val result =
+                        runWriteAction {
+                            helper.importDescriptor(file, descriptor)
+                        }
                     if (result != ImportDescriptorResult.ALREADY_IMPORTED) {
                         anyChange = true
                     }
@@ -262,6 +304,12 @@ class ShortenReferences(val options: (KtElement) -> Options = { Options.DEFAULT 
             }
 
             if (!anyChange) break
+        }
+
+        file.importList?.let { importList ->
+            runWriteAction {
+                CodeStyleManager.getInstance(file.project).reformat(importList, true)
+            }
         }
 
         return elementsToUse
@@ -390,7 +438,7 @@ class ShortenReferences(val options: (KtElement) -> Options = { Options.DEFAULT 
                 var newElement: KtElement? = null
                 // we never want any reformatting to happen because sometimes it causes strange effects (see KT-11633)
                 PostprocessReformattingAspect.getInstance(element.project).disablePostprocessFormattingInside {
-                    newElement = shortenElement(element, options(element))
+                    newElement = runWriteAction { shortenElement(element, options(element)) }
                 }
 
                 if (element in elementSetToUpdate && newElement != element) {
@@ -402,8 +450,10 @@ class ShortenReferences(val options: (KtElement) -> Options = { Options.DEFAULT 
 
         fun removeRootPrefixes() {
             for (pointer in collectElementsVisitor.getElementsWithRootPrefix()) {
-                val element = pointer.element ?: continue
-                shortenElement(element, Options.DEFAULT)
+                val element = runReadAction { pointer.element } ?: continue
+                runWriteAction {
+                    shortenElement(element, Options.DEFAULT)
+                }
             }
         }
 

@@ -376,12 +376,13 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
                 showRestoreReferencesDialog(project, referencesPossibleToRestore)
             if (selectedReferencesToRestore.isEmpty()) return@invokeLater
 
+            val imported = TreeSet<String>()
             project.executeWriteCommand(KotlinBundle.message("resolve.pasted.references")) {
-                val imported = TreeSet<String>()
                 restoreReferences(selectedReferencesToRestore, file, imported)
-
-                reviewAddedImports(project, editor, file, imported)
             }
+
+            performDelayedRefactoringRequests(file.project)
+            reviewAddedImports(project, editor, file, imported)
         }
     }
 
@@ -728,7 +729,6 @@ class KotlinCopyPasteReferenceProcessor : CopyPastePostProcessor<BasicKotlinRefe
                 imported.add(fqName.asString())
             }
         }
-        performDelayedRefactoringRequests(file.project)
     }
 
     private fun findImportableDescriptors(fqName: FqName, file: KtFile): Collection<DeclarationDescriptor> {

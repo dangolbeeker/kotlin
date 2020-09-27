@@ -53,6 +53,11 @@ inline fun invokeLater(crossinline action: () -> Unit) =
     ApplicationManager.getApplication().invokeLater { action() }
 
 inline fun isUnitTestMode(): Boolean = ApplicationManager.getApplication().isUnitTestMode
+inline fun isReadAccessAllowed() = ApplicationManager.getApplication().isReadAccessAllowed
+inline fun isWriteAccessAllowed() = ApplicationManager.getApplication().isWriteAccessAllowed
+inline fun isDispatchThread() = ApplicationManager.getApplication().isDispatchThread
+inline fun assertWriteAccessAllowed() = ApplicationManager.getApplication().assertWriteAccessAllowed()
+inline fun assertReadAccessAllowed() = ApplicationManager.getApplication().assertReadAccessAllowed()
 
 inline fun <reified T : Any> ComponentManager.getServiceSafe(): T =
     this.getService(T::class.java) ?: error("Unable to locate service ${T::class.java.name}")
@@ -61,3 +66,4 @@ fun <T> Project.runReadActionInSmartMode(action: () -> T): T {
     if (ApplicationManager.getApplication().isReadAccessAllowed) return action()
     return DumbService.getInstance(this).runReadActionInSmartMode<T>(action)
 }
+
